@@ -328,6 +328,29 @@ function headerPath(line: string): string | null {
   return stripAB(rest);
 }
 
+/**
+ * The two paths of a `diff --git a/<X> b/<Y>` line. Paths may hold spaces, so the split is
+ * not a plain regex: try each ` b/` split and prefer one whose sides are equal (the common
+ * non-rename case, which also covers a path holding ` b/`); else take the last split (the
+ * greedy reading). Null when the line is not of that form.
+ */
+function parseDiffGit(line: string): [string, string] | null {
+  const rest = line.slice('diff --git '.length);
+  if (!rest.startsWith('a/')) return null;
+  const body = rest.slice(2);
+  const splits: Array<[string, string]> = [];
+  let at = body.indexOf(' b/');
+  while (at >= 0) {
+    const x = body.slice(0, at);
+    const y = body.slice(at + 3);
+    if (x !== '' && y !== '') splits.push([x, y]);
+    at = body.indexOf(' b/', at + 1);
+  }
+  if (splits.length === 0) return null;
+  for (const [x, y] of splits) if (x === y) return [x, y];
+  return splits[splits.length - 1]!;
+}
+
 function applyHunk(state: FileState, h: Hunk, d: number, strict: boolean, path: string): FileState {
   const { oldLines } = bodyOldNew(h.body);
   const lines = state.lines;
@@ -449,11 +472,11 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       continue;
     }
     if (line.startsWith('diff --git ')) {
-      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-      if (m === null) throw new Exit2(`error: parse ${i + 1}`);
+      const p = parseDiffGit(line);
+      if (p === null) throw new Exit2(`error: parse ${i + 1}`);
       cur = newSection();
-      cur.gitOld = m[1]!;
-      cur.gitNew = m[2]!;
+      cur.gitOld = p[0];
+      cur.gitNew = p[1];
       sections.push(cur);
       inHeader = true;
       pairDone = false;
@@ -692,9 +715,11 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       const updLine = i + 1;
       i += 1;
       let moveTo: string | null = null;
-      if (i < last && lines[i]!.startsWith('*** Move to: ')) {
-        moveTo = lines[i]!.slice('*** Move to: '.length).trim();
-        i += 1;
+      let j = i;
+      while (j < last && blank(lines[j]!)) j += 1;
+      if (j < last && lines[j]!.startsWith('*** Move to: ')) {
+        moveTo = lines[j]!.slice('*** Move to: '.length).trim();
+        i = j + 1;
       }
       const chunks: VChunk[] = [];
       let cur: VChunk | null = null;
@@ -703,7 +728,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
         const l = lines[i]!;
         if (isSectionStart(l) || l.trim() === '*** End Patch') break;
         if (l.startsWith('@@')) {
-          if (cur !== null) chunks.push(cur);
+          if (cur !== null) { cur.body = trimBody(cur.body); chunks.push(cur); }
           cur = { anchor: l.slice(2).trim(), eof: false, body: [], fromAt: true };
           firstChunk = false;
           i += 1;
@@ -712,6 +737,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
         if (l.trim() === '*** End of File') {
           if (cur === null) throw new Exit2(`error: parse ${i + 1}`);
           cur.eof = true;
+          cur.body = trimBody(cur.body);
           chunks.push(cur);
           cur = null;
           firstChunk = false;
@@ -731,7 +757,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
         }
         throw new Exit2(`error: parse ${i + 1}`);
       }
-      if (cur !== null) chunks.push(cur);
+      if (cur !== null) { cur.body = trimBody(cur.body); chunks.push(cur); }
       // Blank lines at the end of a section are not part of it.
       if (chunks.length > 0) {
         const lastC = chunks[chunks.length - 1]!;
